@@ -217,9 +217,13 @@ func (h *Donations) Handle(w http.ResponseWriter, r *http.Request) {
 		// the React form can surface "the stream has ended".
 		if liveSessionUUID != nil {
 			var one int
+			// FOR SHARE serializes this gate against the end-stream UPDATE in
+			// tolkien, so a concurrent "go offline" cannot commit between the
+			// check and the intent INSERT (adversarial review finding).
 			err = tx.QueryRowContext(r.Context(), `
 				SELECT 1 FROM live_sessions
 				WHERE id = $1 AND streamer_id = $2 AND ended_at IS NULL
+				FOR SHARE
 			`, *liveSessionUUID, streamerID).Scan(&one)
 			if errors.Is(err, sql.ErrNoRows) {
 				writeJSON(w, http.StatusConflict, map[string]any{"error": map[string]any{"code": "STREAM_ENDED", "message": "the stream has ended"}})
