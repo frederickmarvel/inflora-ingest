@@ -21,6 +21,20 @@ import (
 	"github.com/google/uuid"
 )
 
+// validPaymentMethods mirrors the frozen payment_method enum created in
+// inflora-saruman migration 00001_init (CONTRACT_DRIFT D-034). Unknown methods
+// are rejected at the edge with 422; an absent method is treated as legacy and
+// passes through.
+var validPaymentMethods = map[string]bool{
+	"QRIS":            true,
+	"VIRTUAL_ACCOUNT": true,
+	"EWALLET_GOPAY":   true,
+	"EWALLET_OVO":     true,
+	"EWALLET_DANA":    true,
+	"CREDIT_CARD":     true,
+	"OTHER":           true,
+}
+
 // Donations handles donation-intent creation.
 type Donations struct {
 	DB       *sql.DB
@@ -42,12 +56,24 @@ type DonationIntentRequest struct {
 	DonorEmail       string `json:"donor_email,omitempty"`
 	Message          string `json:"message,omitempty"`
 	IsAnonymous      bool   `json:"is_anonymous"`
+
+	// Rich-intent fields (CONTRACT_DRIFT D-031/D-037). Optional: legacy
+	// clients are unaffected. widget_id names the tapped widget, tier the
+	// chosen tick tier, quantity the gift count; media/call carry the
+	// media-share and call attachments.
+	LiveSessionID string                   `json:"live_session_id,omitempty"`
+	WidgetID      string                   `json:"widget_id,omitempty"`
+	Quantity      int                      `json:"quantity,omitempty"`
+	Tier          string                   `json:"tier,omitempty"`
+	Media         *events.DonationMediaEvent `json:"media,omitempty"`
+	Call          *events.DonationCallEvent  `json:"call,omitempty"`
 }
 
 // DonationIntentResponse is the JSON body returned to the donor.
 type DonationIntentResponse struct {
 	IntentID             string `json:"intent_id"`
 	DonationID           string `json:"donation_id"`
+	StreamerDisplayName  string `json:"streamer_display_name"`
 	AmountIDR            int64  `json:"amount_idr"`
 	MDRIDR               int64  `json:"mdr_idr"`
 	MDRRateBPS           int    `json:"mdr_rate_bps"`
@@ -62,6 +88,7 @@ type DonationIntentResponse struct {
 }
 
 type streamerPricing struct {
+	DisplayName         string
 	DisplayRateIDRPerSec int64
 	DisplayMinSec        int
 	DisplayMaxSec        int
@@ -93,6 +120,24 @@ func (h *Donations) Handle(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"code": "VALIDATION_FAILED", "message": "streamer_id must be a uuid"}})
 		return
+	}
+	// D-034: validate payment_method against the frozen enum (see map above).
+	if req.PaymentMethod != "" && !validPaymentMethods[req.PaymentMethod] {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": map[string]any{"code": "VALIDATION_FAILED", "message": fmt.Sprintf("payment_method %q is not supported", req.PaymentMethod)}})
+		return
+	}
+	if req.Quantity < 0 {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": map[string]any{"code": "VALIDATION_FAILED", "message": "quantity must not be negative"}})
+		return
+	}
+	var liveSessionUUID *uuid.UUID
+	if req.LiveSessionID != "" {
+		lsID, err := uuid.Parse(req.LiveSessionID)
+		if err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": map[string]any{"code": "VALIDATION_FAILED", "message": "live_session_id must be a uuid"}})
+			return
+		}
+		liveSessionUUID = &lsID
 	}
 	bodyHash, err := hashBody(&req)
 	if err != nil {
@@ -167,6 +212,24 @@ func (h *Donations) Handle(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"code": "VALIDATION_FAILED", "message": fmt.Sprintf("amount_idr must be between %d and %d for this streamer", pricing.MinDonationIDR, pricing.MaxDonationIDR)}})
 			return
 		}
+		// D-037: when the tip form carries a live session, it must still be
+		// open for this streamer. A closed session maps to 409 STREAM_ENDED so
+		// the React form can surface "the stream has ended".
+		if liveSessionUUID != nil {
+			var one int
+			err = tx.QueryRowContext(r.Context(), `
+				SELECT 1 FROM live_sessions
+				WHERE id = $1 AND streamer_id = $2 AND ended_at IS NULL
+			`, *liveSessionUUID, streamerID).Scan(&one)
+			if errors.Is(err, sql.ErrNoRows) {
+				writeJSON(w, http.StatusConflict, map[string]any{"error": map[string]any{"code": "STREAM_ENDED", "message": "the stream has ended"}})
+				return
+			}
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"code": "INTERNAL", "message": err.Error()}})
+				return
+			}
+		}
 		displayDurationSec, err = calculateDisplayDuration(req.AmountIDR, pricing.DisplayRateIDRPerSec, pricing.DisplayMinSec, pricing.DisplayMaxSec)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"code": "INVALID_STREAMER_SETTINGS", "message": err.Error()}})
@@ -175,6 +238,21 @@ func (h *Donations) Handle(w http.ResponseWriter, r *http.Request) {
 	} else if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"code": "INTERNAL", "message": err.Error()}})
 		return
+	}
+	// The response carries the creator's display name (CONTRACT_DRIFT D-031).
+	// Replays take it from streamers, since the pricing snapshot read above
+	// does not include it.
+	displayName := ""
+	if existingIntent {
+		err = tx.QueryRowContext(r.Context(), `
+			SELECT display_name FROM streamers WHERE id = $1
+		`, streamerID).Scan(&displayName)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"code": "INTERNAL", "message": err.Error()}})
+			return
+		}
+	} else {
+		displayName = pricing.DisplayName
 	}
 	// 1. Insert a new donation row with stable intent_id. Reclaimed retries use
 	// the immutable snapshot loaded above instead of current streamer settings.
@@ -187,15 +265,37 @@ func (h *Donations) Handle(w http.ResponseWriter, r *http.Request) {
 		// up. Keeping them equal to amount_idr preserves the frozen-contract
 		// invariant gross == net + platform_fee + mdr that Saruman verifies at
 		// capture time.
+		var mediaJSON, callJSON, liveSessionParam any
+		if req.Media != nil {
+			b, err := json.Marshal(req.Media)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"code": "INTERNAL", "message": err.Error()}})
+				return
+			}
+			mediaJSON = b
+		}
+		if req.Call != nil {
+			b, err := json.Marshal(req.Call)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"code": "INTERNAL", "message": err.Error()}})
+				return
+			}
+			callJSON = b
+		}
+		if liveSessionUUID != nil {
+			liveSessionParam = *liveSessionUUID
+		}
 		insertResult, err := tx.ExecContext(r.Context(), `
 			INSERT INTO donations (id, streamer_id, intent_id, status, settlement_status,
 			    amount_idr, gross_charged_idr, net_idr, currency, donor_display_name, donor_email, message, is_anonymous,
 			    display_rate_idr_per_sec, display_min_sec, display_max_sec, display_duration_sec,
+			    live_session_id, widget_id, quantity, tier, media, call,
 			    expires_at, created_at)
-			VALUES ($1,$2,$3,'INTENT_CREATED','PENDING',$4,$4,$4,'IDR',$5,$6,$7,$8,$9,$10,$11,$12,$13, NOW())
+			VALUES ($1,$2,$3,'INTENT_CREATED','PENDING',$4,$4,$4,'IDR',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,NOW())
 			ON CONFLICT (intent_id) DO NOTHING
 		`, donationID, streamerID, intentID, req.AmountIDR, req.DonorDisplayName, req.DonorEmail, req.Message, req.IsAnonymous,
-			pricing.DisplayRateIDRPerSec, pricing.DisplayMinSec, pricing.DisplayMaxSec, displayDurationSec, expiresAt)
+			pricing.DisplayRateIDRPerSec, pricing.DisplayMinSec, pricing.DisplayMaxSec, displayDurationSec,
+			liveSessionParam, optionalString(req.WidgetID), optionalInt(req.Quantity), optionalString(req.Tier), mediaJSON, callJSON, expiresAt)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"code": "INTERNAL", "message": err.Error()}})
 			return
@@ -223,6 +323,12 @@ func (h *Donations) Handle(w http.ResponseWriter, r *http.Request) {
 		DisplayMinSec:        pricing.DisplayMinSec,
 		DisplayMaxSec:        pricing.DisplayMaxSec,
 		DisplayDurationSec:   displayDurationSec,
+		LiveSessionID:        liveSessionIDStr(liveSessionUUID),
+		WidgetID:             req.WidgetID,
+		Quantity:             optionalIntPtr(req.Quantity),
+		Tier:                 req.Tier,
+		Media:                req.Media,
+		Call:                 req.Call,
 		ExpiresAt:            expiresAt,
 		CreatedAt:            now,
 	}
@@ -259,6 +365,7 @@ func (h *Donations) Handle(w http.ResponseWriter, r *http.Request) {
 	respBody := DonationIntentResponse{
 		IntentID:             intentID.String(),
 		DonationID:           donationID.String(),
+		StreamerDisplayName:  displayName,
 		AmountIDR:            req.AmountIDR,
 		MDRIDR:               0,
 		MDRRateBPS:           0,
@@ -296,7 +403,7 @@ func loadStreamerPricing(ctx context.Context, tx *sql.Tx, streamerID uuid.UUID) 
 	var pricing streamerPricing
 	err := tx.QueryRowContext(ctx, `
 		SELECT ss.display_rate_idr_per_sec, ss.display_min_sec, ss.display_max_sec,
-		       ss.min_donation_idr, ss.max_donation_idr
+		       ss.min_donation_idr, ss.max_donation_idr, s.display_name
 		FROM streamer_settings ss
 		JOIN streamers s ON s.id = ss.streamer_id
 		WHERE ss.streamer_id = $1 AND s.is_active = TRUE
@@ -307,8 +414,38 @@ func loadStreamerPricing(ctx context.Context, tx *sql.Tx, streamerID uuid.UUID) 
 		&pricing.DisplayMaxSec,
 		&pricing.MinDonationIDR,
 		&pricing.MaxDonationIDR,
+		&pricing.DisplayName,
 	)
 	return pricing, err
+}
+
+func optionalString(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+func optionalInt(n int) any {
+	if n == 0 {
+		return nil
+	}
+	return n
+}
+
+func optionalIntPtr(n int) *int {
+	if n == 0 {
+		return nil
+	}
+	return &n
+}
+
+func liveSessionIDStr(id *uuid.UUID) *string {
+	if id == nil {
+		return nil
+	}
+	s := id.String()
+	return &s
 }
 
 func calculateDisplayDuration(amountIDR, rateIDRPerSec int64, minSec, maxSec int) (int, error) {
