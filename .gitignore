@@ -7,3 +7,6 @@
 bin/
 coverage.out
 *.log
+
+# Local build output
+/server
