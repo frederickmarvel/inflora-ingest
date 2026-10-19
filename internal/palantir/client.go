@@ -16,10 +16,12 @@ const (
 	rpcTimeout  = 5 * time.Second
 )
 
-// Client is a thin wrapper around the generated TopUpServiceClient.
+// Client is a thin wrapper around the generated TopUpServiceClient and
+// WithdrawalServiceClient.
 type Client struct {
 	pb.TopUpServiceClient
-	conn *grpc.ClientConn
+	withdrawals pb.WithdrawalServiceClient
+	conn        *grpc.ClientConn
 }
 
 // New dials the Palantir service and authenticates every unary RPC with the
@@ -38,7 +40,7 @@ func New(ctx context.Context, addr, engineAPIKey string, opts ...grpc.DialOption
 	if err != nil {
 		return nil, err
 	}
-	return &Client{TopUpServiceClient: pb.NewTopUpServiceClient(conn), conn: conn}, nil
+	return &Client{TopUpServiceClient: pb.NewTopUpServiceClient(conn), withdrawals: pb.NewWithdrawalServiceClient(conn), conn: conn}, nil
 }
 
 // Close releases the underlying gRPC connection.
@@ -63,4 +65,11 @@ func (c *Client) SettleTopUp(ctx context.Context, req *pb.SettleTopUpRequest) (*
 	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
 	defer cancel()
 	return c.TopUpServiceClient.SettleTopUp(rpcCtx, req)
+}
+
+// SettleWithdrawal forwards a provider payout webhook to Palantir (T15).
+func (c *Client) SettleWithdrawal(ctx context.Context, req *pb.SettleWithdrawalRequest) (*pb.SettleWithdrawalResponse, error) {
+	rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+	defer cancel()
+	return c.withdrawals.SettleWithdrawal(rpcCtx, req)
 }

@@ -21,11 +21,17 @@ type topUpSettler interface {
 	SettleTopUp(context.Context, *pb.SettleTopUpRequest) (*pb.SettleTopUpResponse, error)
 }
 
+type withdrawalSettler interface {
+	SettleWithdrawal(context.Context, *pb.SettleWithdrawalRequest) (*pb.SettleWithdrawalResponse, error)
+}
+
 // PaymentWebhook is the public, stateless provider-webhook edge. Signature
 // verification and durable idempotency deliberately live in Palantir.
-type PaymentWebhook struct{ Palantir topUpSettler }
+type PaymentWebhook struct{ Palantir interface{ topUpSettler; withdrawalSettler } }
 
-func NewPaymentWebhook(p topUpSettler) *PaymentWebhook { return &PaymentWebhook{Palantir: p} }
+func NewPaymentWebhook(p interface{ topUpSettler; withdrawalSettler }) *PaymentWebhook {
+	return &PaymentWebhook{Palantir: p}
+}
 
 func (h *PaymentWebhook) Handle(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -54,6 +60,10 @@ func (h *PaymentWebhook) Handle(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"code": "VALIDATION_FAILED", "message": err.Error()}})
 		return
 	}
+	if isPayoutWebhook(providerName, body) {
+		h.settleWithdrawal(w, r, providerName, eventID, chargeID, signature, body)
+		return
+	}
 	_, err = h.Palantir.SettleTopUp(r.Context(), &pb.SettleTopUpRequest{
 		ProviderEventId: eventID,
 		ProviderName:    providerName,
@@ -78,6 +88,67 @@ func (h *PaymentWebhook) Handle(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// settleWithdrawal forwards a provider payout webhook to Palantir's
+// SettleWithdrawal (T15). The mirror + webhook_events dedupe live in
+// Palantir; this edge only routes and maps errors.
+func (h *PaymentWebhook) settleWithdrawal(w http.ResponseWriter, r *http.Request, providerName, eventID, chargeID, signature string, body []byte) {
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"code": "VALIDATION_FAILED", "message": "webhook body must be a JSON object"}})
+		return
+	}
+	get := func(name string) string {
+		var value string
+		_ = json.Unmarshal(payload[name], &value)
+		return strings.TrimSpace(value)
+	}
+	providerPayoutID := firstNonEmpty(get("withdrawal_id"), get("transaction_id"), chargeID)
+	sarumanPayoutID := get("payout_id")
+	_, err := h.Palantir.SettleWithdrawal(r.Context(), &pb.SettleWithdrawalRequest{
+		ProviderPayoutId:  providerPayoutID,
+		ProviderEventId:   eventID,
+		RawPayload:        body,
+		ProviderName:      providerName,
+		Signature:         signature,
+		Headers:           flattenHeaders(r.Header),
+		SarumanPayoutId:   sarumanPayoutID,
+	})
+	if err != nil {
+		code, httpStatus := "PROVIDER_ERROR", http.StatusBadGateway
+		switch status.Code(err) {
+		case codes.InvalidArgument, codes.NotFound:
+			code, httpStatus = "VALIDATION_FAILED", http.StatusBadRequest
+		case codes.Unauthenticated, codes.PermissionDenied:
+			code, httpStatus = "INVALID_SIGNATURE", http.StatusUnauthorized
+		case codes.AlreadyExists:
+			code, httpStatus = "IDEMPOTENCY_CONFLICT", http.StatusConflict
+		}
+		writeJSON(w, httpStatus, map[string]any{"error": map[string]any{"code": code, "message": status.Convert(err).Message()}})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// isPayoutWebhook detects payout (withdrawal) webhook payloads: they carry a
+// withdrawal_id (provider payout id) or the platform payout_id and are only
+// produced by pivot at Phase C.
+func isPayoutWebhook(providerName string, body []byte) bool {
+	if !strings.EqualFold(providerName, "pivot") {
+		return false
+	}
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil {
+		return false
+	}
+	for _, key := range []string{"withdrawal_id", "payout_id"} {
+		var value string
+		if json.Unmarshal(payload[key], &value) == nil && strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func extractPaymentWebhook(headers http.Header, body []byte) (providerName, eventID, chargeID, signature string, err error) {
 	var payload map[string]json.RawMessage
 	if len(bytes.TrimSpace(body)) == 0 || json.Unmarshal(body, &payload) != nil {
@@ -96,7 +167,9 @@ func extractPaymentWebhook(headers http.Header, body []byte) (providerName, even
 	case get("event_id") != "":
 		providerName = "pivot"
 		eventID = get("event_id")
-		chargeID = firstNonEmpty(get("transaction_id"), get("charge_id"))
+		// Payout webhooks identify themselves by withdrawal_id (no charge),
+		// so fall back to those fields to keep the id gate below meaningful.
+		chargeID = firstNonEmpty(get("transaction_id"), get("charge_id"), get("withdrawal_id"), get("payout_id"))
 		signature = firstNonEmpty(headers.Get("X-Signature"), headers.Get("X-Pivot-Signature"))
 	case headers.Get("X-Signature") != "" || get("transaction_id") != "" || get("transaction_status") != "":
 		providerName = "midtrans"

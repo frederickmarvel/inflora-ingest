@@ -10,11 +10,19 @@ import (
 	pb "github.com/frederickmarvel/inflora-shared/gen/go/palantir/v1"
 )
 
-type recordingSettler struct{ req *pb.SettleTopUpRequest }
+type recordingSettler struct {
+	req       *pb.SettleTopUpRequest
+	wdReq     *pb.SettleWithdrawalRequest
+}
 
 func (s *recordingSettler) SettleTopUp(_ context.Context, req *pb.SettleTopUpRequest) (*pb.SettleTopUpResponse, error) {
 	s.req = req
 	return &pb.SettleTopUpResponse{}, nil
+}
+
+func (s *recordingSettler) SettleWithdrawal(_ context.Context, req *pb.SettleWithdrawalRequest) (*pb.SettleWithdrawalResponse, error) {
+	s.wdReq = req
+	return &pb.SettleWithdrawalResponse{}, nil
 }
 
 func TestPaymentWebhookForwardsMidtransRawSignatureAndHeaders(t *testing.T) {
@@ -61,5 +69,30 @@ func TestExtractXenditWebhook(t *testing.T) {
 	provider, eventID, chargeID, signature, err := extractPaymentWebhook(headers, []byte(`{"id":"invoice-1","external_id":"donation-1","status":"PAID"}`))
 	if err != nil || provider != "xendit" || eventID != "invoice-1:paid" || chargeID != "invoice-1" || signature != "token" {
 		t.Fatalf("got %q %q %q %q err=%v", provider, eventID, chargeID, signature, err)
+	}
+}
+
+func TestPaymentWebhookRoutesPayoutWebhookToSettleWithdrawal(t *testing.T) {
+	settler := &recordingSettler{}
+	h := NewPaymentWebhook(settler)
+	body := `{"event_id":"evt-1","withdrawal_id":"pivot_withdrawal_abc","payout_id":"22222222-2222-4222-8222-222222222222","status":"SUCCESS"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/webhooks/payment", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Signature", "signature-value")
+	rec := httptest.NewRecorder()
+	h.Handle(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if settler.wdReq == nil {
+		t.Fatal("payout webhook was not routed to SettleWithdrawal")
+	}
+	if settler.wdReq.ProviderName != "pivot" || settler.wdReq.ProviderEventId != "evt-1" ||
+		settler.wdReq.ProviderPayoutId != "pivot_withdrawal_abc" ||
+		settler.wdReq.SarumanPayoutId != "22222222-2222-4222-8222-222222222222" {
+		t.Fatalf("request=%+v", settler.wdReq)
+	}
+	if settler.req != nil {
+		t.Fatal("payout webhook must not be routed to SettleTopUp")
 	}
 }
