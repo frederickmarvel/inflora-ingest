@@ -40,11 +40,14 @@ type Donations struct {
 	DB       *sql.DB
 	Idem     *idempotency.Store
 	Palantir *palantir.Client
+	// ProviderName keys the active mdr_rates lookup (D-061). It must agree
+	// with palantir's PROVIDER_DEFAULT (both default to "pivot").
+	ProviderName string
 }
 
 // NewDonations constructs a donations handler.
-func NewDonations(db *sql.DB, idem *idempotency.Store, pal *palantir.Client) *Donations {
-	return &Donations{DB: db, Idem: idem, Palantir: pal}
+func NewDonations(db *sql.DB, idem *idempotency.Store, pal *palantir.Client, providerName string) *Donations {
+	return &Donations{DB: db, Idem: idem, Palantir: pal, ProviderName: providerName}
 }
 
 // DonationIntentRequest is the JSON body for POST /v1/donations.
@@ -94,6 +97,21 @@ type streamerPricing struct {
 	DisplayMaxSec        int
 	MinDonationIDR       int64
 	MaxDonationIDR       int64
+	// PlatformFeeBPS is the per-streamer fee (D-060, migration 00017),
+	// snapshotted FOR SHARE inside the intent transaction.
+	PlatformFeeBPS int
+}
+
+// intentFees carries the per-calculation fee snapshot (D-060/D-061). Each
+// donation's fees are computed from configuration rows read inside its own
+// intent transaction and frozen into the donations row; replay returns the
+// stored values, never a recomputation.
+type intentFees struct {
+	PlatformFeeIDR  int64
+	NetIDR          int64
+	MDRIDR          int64
+	MDRRateBPS      int
+	GrossChargedIDR int64
 }
 
 // Handle is the http.Handler.
@@ -186,9 +204,11 @@ func (h *Donations) Handle(w http.ResponseWriter, r *http.Request) {
 	donationID := uuid.NewSHA1(uuid.NameSpaceURL, []byte(endpoint+"\x00"+idemKey+"\x00donation"))
 	var pricing streamerPricing
 	var displayDurationSec int
+	var fees intentFees
 	existingIntent := true
 	err = tx.QueryRowContext(r.Context(), `
-		SELECT display_rate_idr_per_sec, display_min_sec, display_max_sec, display_duration_sec
+		SELECT display_rate_idr_per_sec, display_min_sec, display_max_sec, display_duration_sec,
+		       platform_fee_idr, mdr_idr, mdr_rate_bps, gross_charged_idr, net_idr
 		FROM donations
 		WHERE intent_id = $1
 	`, intentID).Scan(
@@ -196,6 +216,11 @@ func (h *Donations) Handle(w http.ResponseWriter, r *http.Request) {
 		&pricing.DisplayMinSec,
 		&pricing.DisplayMaxSec,
 		&displayDurationSec,
+		&fees.PlatformFeeIDR,
+		&fees.MDRIDR,
+		&fees.MDRRateBPS,
+		&fees.GrossChargedIDR,
+		&fees.NetIDR,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		existingIntent = false
@@ -212,6 +237,22 @@ func (h *Donations) Handle(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"code": "VALIDATION_FAILED", "message": fmt.Sprintf("amount_idr must be between %d and %d for this streamer", pricing.MinDonationIDR, pricing.MaxDonationIDR)}})
 			return
 		}
+		// D-060/D-061: compute the fee snapshot inside the intent tx. Platform
+		// fee is deducted from the donation (net = amount - fee); MDR is
+		// charged to the donor on top (gross = amount + mdr). The donation row
+		// freezes both; capture validates gross == net + fee + mdr.
+		fees.PlatformFeeIDR = req.AmountIDR * int64(pricing.PlatformFeeBPS) / 10000
+		fees.NetIDR = req.AmountIDR - fees.PlatformFeeIDR
+		// PlatformFeeBPS <= 9999 (00017 CHECK) guarantees fee < amount for any
+		// amount >= 1, so net stays positive (frozen invariant).
+		mdrBPS, mdrFlatIDR, err := loadActiveMDR(r.Context(), tx, h.ProviderName, req.PaymentMethod)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"code": "INTERNAL", "message": err.Error()}})
+			return
+		}
+		fees.MDRRateBPS = mdrBPS
+		fees.MDRIDR = req.AmountIDR*int64(mdrBPS)/10000 + mdrFlatIDR
+		fees.GrossChargedIDR = req.AmountIDR + fees.MDRIDR
 		// D-037: when the tip form carries a live session, it must still be
 		// open for this streamer. A closed session maps to 409 STREAM_ENDED so
 		// the React form can surface "the stream has ended".
@@ -289,17 +330,22 @@ func (h *Donations) Handle(w http.ResponseWriter, r *http.Request) {
 		if liveSessionUUID != nil {
 			liveSessionParam = *liveSessionUUID
 		}
+		// D-060/D-061: gross_charged_idr/net_idr/mdr_idr/mdr_rate_bps/
+		// platform_fee_idr freeze the computed fee snapshot (above) so capture
+		// can validate the frozen-contract invariant gross == net + fee + mdr.
 		insertResult, err := tx.ExecContext(r.Context(), `
 			INSERT INTO donations (id, streamer_id, intent_id, status, settlement_status,
 			    amount_idr, gross_charged_idr, net_idr, currency, donor_display_name, donor_email, message, is_anonymous,
 			    display_rate_idr_per_sec, display_min_sec, display_max_sec, display_duration_sec,
 			    live_session_id, widget_id, quantity, tier, media, call,
+			    mdr_idr, mdr_rate_bps, platform_fee_idr,
 			    expires_at, created_at)
-			VALUES ($1,$2,$3,'INTENT_CREATED','PENDING',$4,$4,$4,'IDR',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,NOW())
+			VALUES ($1,$2,$3,'INTENT_CREATED','PENDING',$4,$20,$21,'IDR',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$22,$23,$24,$19,NOW())
 			ON CONFLICT (intent_id) DO NOTHING
 		`, donationID, streamerID, intentID, req.AmountIDR, req.DonorDisplayName, req.DonorEmail, req.Message, req.IsAnonymous,
 			pricing.DisplayRateIDRPerSec, pricing.DisplayMinSec, pricing.DisplayMaxSec, displayDurationSec,
-			liveSessionParam, optionalString(req.WidgetID), optionalInt(req.Quantity), optionalString(req.Tier), mediaJSON, callJSON, expiresAt)
+			liveSessionParam, optionalString(req.WidgetID), optionalInt(req.Quantity), optionalString(req.Tier), mediaJSON, callJSON,
+			expiresAt, fees.GrossChargedIDR, fees.NetIDR, fees.MDRIDR, fees.MDRRateBPS, fees.PlatformFeeIDR)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"code": "INTERNAL", "message": err.Error()}})
 			return
@@ -353,11 +399,15 @@ func (h *Donations) Handle(w http.ResponseWriter, r *http.Request) {
 	}
 	committed = true
 	// 3. Call Palantir CreateTopUp. Palantir's idempotency protects against
-	// duplicate provider calls if this request retries.
+	// duplicate provider calls if this request retries. MDR/gross are
+	// propagated (D-061) so the gateway charges the donor the gross amount;
+	// on replay the stored snapshot reproduces the original request hash.
 	palResp, err := h.Palantir.CreateTopUp(r.Context(), &pb.CreateTopUpRequest{
 		SarumanDonationId: donationID.String(),
 		StreamerId:        streamerID.String(),
 		AmountIdr:         req.AmountIDR,
+		MdrIdr:            fees.MDRIDR,
+		GrossChargedIdr:   fees.GrossChargedIDR,
 		Currency:          "IDR",
 		DonorDisplayName:  req.DonorDisplayName,
 		IdempotencyKey:    intentID.String(),
@@ -371,11 +421,11 @@ func (h *Donations) Handle(w http.ResponseWriter, r *http.Request) {
 		DonationID:           donationID.String(),
 		StreamerDisplayName:  displayName,
 		AmountIDR:            req.AmountIDR,
-		MDRIDR:               0,
-		MDRRateBPS:           0,
-		GrossChargedIDR:      req.AmountIDR,
-		PlatformFeeIDR:       0,
-		NetIDR:               req.AmountIDR,
+		MDRIDR:               fees.MDRIDR,
+		MDRRateBPS:           fees.MDRRateBPS,
+		GrossChargedIDR:      fees.GrossChargedIDR,
+		PlatformFeeIDR:       fees.PlatformFeeIDR,
+		NetIDR:               fees.NetIDR,
 		Currency:             "IDR",
 		DisplayRateIDRPerSec: pricing.DisplayRateIDRPerSec,
 		DisplayDurationSec:   displayDurationSec,
@@ -407,7 +457,8 @@ func loadStreamerPricing(ctx context.Context, tx *sql.Tx, streamerID uuid.UUID) 
 	var pricing streamerPricing
 	err := tx.QueryRowContext(ctx, `
 		SELECT ss.display_rate_idr_per_sec, ss.display_min_sec, ss.display_max_sec,
-		       ss.min_donation_idr, ss.max_donation_idr, s.display_name
+		       ss.min_donation_idr, ss.max_donation_idr, s.display_name,
+		       ss.platform_fee_bps
 		FROM streamer_settings ss
 		JOIN streamers s ON s.id = ss.streamer_id
 		WHERE ss.streamer_id = $1 AND s.is_active = TRUE
@@ -419,8 +470,37 @@ func loadStreamerPricing(ctx context.Context, tx *sql.Tx, streamerID uuid.UUID) 
 		&pricing.MinDonationIDR,
 		&pricing.MaxDonationIDR,
 		&pricing.DisplayName,
+		&pricing.PlatformFeeBPS,
 	)
 	return pricing, err
+}
+
+// loadActiveMDR returns the active mdr_rates row for (provider, method)
+// (D-061). An empty method (legacy request) or a missing row yields zeros —
+// no rate charged — and only a real query error propagates.
+func loadActiveMDR(ctx context.Context, tx *sql.Tx, providerName, method string) (int, int64, error) {
+	if providerName == "" || method == "" {
+		return 0, 0, nil
+	}
+	var bps int
+	var flat int64
+	err := tx.QueryRowContext(ctx, `
+		SELECT mdr_bps, flat_idr
+		FROM mdr_rates
+		WHERE provider_name = $1 AND payment_method = $2::payment_method
+		  AND is_active
+		  AND effective_from <= NOW()
+		  AND (effective_to IS NULL OR effective_to > NOW())
+		ORDER BY effective_from DESC
+		LIMIT 1
+	`, providerName, method).Scan(&bps, &flat)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	return bps, flat, nil
 }
 
 func optionalString(s string) any {

@@ -77,7 +77,10 @@ func main() {
 		logger.Fatal("configure outbox", zap.Error(err))
 	}
 	idem := idempotency.NewStore(database)
-	dh := handler.NewDonations(database, idem, pc)
+	// PROVIDER_NAME keys the mdr_rates lookup inside donation-intent creation
+	// (D-061). It must agree with palantir's PROVIDER_DEFAULT (both "pivot").
+	providerName := getenv("PROVIDER_NAME", "pivot")
+	dh := handler.NewDonations(database, idem, pc, providerName)
 	wh := handler.NewPaymentWebhook(pc)
 	muxH := http.NewServeMux()
 	muxH.Handle("/v1/donations", middleware.RequestID(middleware.Logging(logger)(http.HandlerFunc(dh.Handle))))
